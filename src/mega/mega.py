@@ -1,4 +1,3 @@
-
 import math
 import re
 import json
@@ -24,6 +23,9 @@ from .crypto import (a32_to_base64, encrypt_key, base64_url_encode,
                      decrypt_attr, a32_to_str, get_chunks, str_to_a32,
                      decrypt_key, mpi_to_int, stringhash, prepare_key, make_id,
                      makebyte, modular_inverse)
+
+# Import tqdm here
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +200,7 @@ class Mega:
             file_id = re.findall(r'\W\w\w\w\w\w\w\w\w\W', url)[0][1:-1]
             id_index = re.search(file_id, url).end()
             key = url[id_index + 1:]
-            return f'{file_id}!{key}'
+            return f'!'
         elif '!' in url:
             # V1 URL structure
             match = re.findall(r'/#!(.*)', url)
@@ -372,7 +374,7 @@ class Mega:
             decrypted_key = a32_to_base64(
                 decrypt_key(base64_to_a32(file_key), self.master_key))
             return (f'{self.schema}://{self.domain}'
-                    f'/#!{public_handle}!{decrypted_key}')
+                    f'/#!!')
         else:
             raise ValueError('''Upload() response required as input,
                             use get_link() for regular file input''')
@@ -389,7 +391,7 @@ class Mega:
                                    "(is this a shared file?)")
             decrypted_key = a32_to_base64(file['key'])
             return (f'{self.schema}://{self.domain}'
-                    f'/#!{public_handle}!{decrypted_key}')
+                    f'/#!!')
         else:
             raise ValidationError('File id and key must be present')
 
@@ -411,7 +413,7 @@ class Mega:
                                    "(is this a shared file?)")
             decrypted_key = a32_to_base64(file['shared_folder_key'])
             return (f'{self.schema}://{self.domain}'
-                    f'/#F!{public_handle}!{decrypted_key}')
+                    f'/#F!!')
         else:
             raise ValidationError('File id and key must be present')
 
@@ -656,7 +658,7 @@ class Mega:
                        dest_filename=None,
                        is_public=False,
                        file=None,
-                       progress_hook=True,
+                       progress_hook=None, # <--- CRITICAL: MUST BE 'None' by default
                        progress_args=None):
         if file is None:
             if is_public:
@@ -705,69 +707,75 @@ class Mega:
         else:
             dest_path += '/'
 
-        with tempfile.NamedTemporaryFile(mode='w+b',
-                                         prefix='megapy_',
-                                         delete=False) as temp_output_file:
-            k_str = a32_to_str(k)
-            counter = Counter.new(128,
-                                  initial_value=((iv[0] << 32) + iv[1]) << 64)
-            aes = AES.new(k_str, AES.MODE_CTR, counter=counter)
+        # Initialize tqdm progress bar
+        with tqdm(total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                  desc=f"Downloading {file_name}") as pbar:
+            with tempfile.NamedTemporaryFile(mode='w+b',
+                                             prefix='megapy_',
+                                             delete=False) as temp_output_file:
+                k_str = a32_to_str(k)
+                counter = Counter.new(128,
+                                      initial_value=((iv[0] << 32) + iv[1]) << 64)
+                aes = AES.new(k_str, AES.MODE_CTR, counter=counter)
 
-            mac_str = '\0' * 16
-            mac_encryptor = AES.new(k_str, AES.MODE_CBC,
-                                    mac_str.encode("utf8"))
-            iv_str = a32_to_str([iv[0], iv[1], iv[0], iv[1]])
+                mac_str = '\0' * 16
+                mac_encryptor = AES.new(k_str, AES.MODE_CBC,
+                                        mac_str.encode("utf8"))
+                iv_str = a32_to_str([iv[0], iv[1], iv[0], iv[1]])
 
-            for chunk_start, chunk_size in get_chunks(file_size):
-                chunk = input_file.read(chunk_size)
-                chunk = aes.decrypt(chunk)
-                temp_output_file.write(chunk)
+                for chunk_start, chunk_size in get_chunks(file_size):
+                    chunk = input_file.read(chunk_size)
+                    chunk = aes.decrypt(chunk)
+                    temp_output_file.write(chunk)
+                    pbar.update(len(chunk)) # Update tqdm here
 
-                encryptor = AES.new(k_str, AES.MODE_CBC, iv_str)
-                for i in range(0, len(chunk) - 16, 16):
+                    encryptor = AES.new(k_str, AES.MODE_CBC, iv_str)
+                    for i in range(0, len(chunk) - 16, 16):
+                        block = chunk[i:i + 16]
+                        encryptor.encrypt(block)
+
+                    # fix for files under 16 bytes failing
+                    if file_size > 16:
+                        i += 16
+                    else:
+                        i = 0
+
                     block = chunk[i:i + 16]
-                    encryptor.encrypt(block)
+                    if len(block) % 16:
+                        block += b'\0' * (16 - (len(block) % 16))
+                    mac_str = mac_encryptor.encrypt(encryptor.encrypt(block))
 
-                # fix for files under 16 bytes failing
-                if file_size > 16:
-                    i += 16
-                else:
-                    i = 0
-
-                block = chunk[i:i + 16]
-                if len(block) % 16:
-                    block += b'\0' * (16 - (len(block) % 16))
-                mac_str = mac_encryptor.encrypt(encryptor.encrypt(block))
-
-                file_info = os.stat(temp_output_file.name)
-                logger.info('%s of %s downloaded', file_info.st_size,
-                            file_size)
-                if progress_hook:
+                    file_info = os.stat(temp_output_file.name)
+                    logger.info('%s of %s downloaded', file_info.st_size,
+                                file_size)
+                    # <--- CRITICAL: This 'if' check MUST EXIST before calling progress_hook
+                    if callable(progress_hook):
+                        progress_hook({
+                            'current': file_info.st_size,
+                            'total': file_size,
+                            'name': file_name,
+                            'status': 'downloading',
+                            'args': progress_args
+                        })
+                file_mac = str_to_a32(mac_str)
+                # check mac integrity
+                if (file_mac[0] ^ file_mac[1],
+                        file_mac[2] ^ file_mac[3]) != meta_mac:
+                    raise ValueError('Mismatched mac')
+                output_path = Path(dest_path + file_name)
+                temp_output_file.close()
+                shutil.move(temp_output_file.name, output_path)
+                # <--- CRITICAL: This 'if' check MUST EXIST before calling progress_hook
+                if callable(progress_hook):
+                    file_info = os.stat(temp_output_file.name)
                     progress_hook({
                         'current': file_info.st_size,
                         'total': file_size,
-                        'name': file_name,
-                        'status': 'downloading',
+                        'name': temp_output_file.name,
+                        'status': 'finished',
                         'args': progress_args
                     })
-            file_mac = str_to_a32(mac_str)
-            # check mac integrity
-            if (file_mac[0] ^ file_mac[1],
-                    file_mac[2] ^ file_mac[3]) != meta_mac:
-                raise ValueError('Mismatched mac')
-            output_path = Path(dest_path + file_name)
-            temp_output_file.close()
-            shutil.move(temp_output_file.name, output_path)
-            if progress_hook:
-                file_info = os.stat(temp_output_file.name)
-                progress_hook({
-                    'current': file_info.st_size,
-                    'total': file_size,
-                    'name': temp_output_file.name,
-                    'status': 'finished',
-                    'args': progress_args
-                })
-            return output_path
+                return output_path
 
     def upload(self, filename, dest=None, dest_filename=None):
         # determine storage node
@@ -789,86 +797,93 @@ class Mega:
                 128, initial_value=((ul_key[4] << 32) + ul_key[5]) << 64)
             aes = AES.new(k_str, AES.MODE_CTR, counter=count)
 
-            upload_progress = 0
-            completion_file_handle = None
+            # Initialize tqdm progress bar for upload
+            upload_file_name_display = dest_filename or os.path.basename(filename)
+            with tqdm(total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                      desc=f"Uploading {upload_file_name_display}") as pbar:
 
-            mac_str = '\0' * 16
-            mac_encryptor = AES.new(k_str, AES.MODE_CBC,
-                                    mac_str.encode("utf8"))
-            iv_str = a32_to_str([ul_key[4], ul_key[5], ul_key[4], ul_key[5]])
-            if file_size > 0:
-                for chunk_start, chunk_size in get_chunks(file_size):
-                    chunk = input_file.read(chunk_size)
-                    upload_progress += len(chunk)
+                upload_progress = 0
+                completion_file_handle = None
 
-                    encryptor = AES.new(k_str, AES.MODE_CBC, iv_str)
-                    for i in range(0, len(chunk) - 16, 16):
+                mac_str = '\0' * 16
+                mac_encryptor = AES.new(k_str, AES.MODE_CBC,
+                                        mac_str.encode("utf8"))
+                iv_str = a32_to_str([ul_key[4], ul_key[5], ul_key[4], ul_key[5]])
+                if file_size > 0:
+                    for chunk_start, chunk_size in get_chunks(file_size):
+                        chunk = input_file.read(chunk_size)
+                        upload_progress += len(chunk)
+
+                        encryptor = AES.new(k_str, AES.MODE_CBC, iv_str)
+                        for i in range(0, len(chunk) - 16, 16):
+                            block = chunk[i:i + 16]
+                            encryptor.encrypt(block)
+
+                        # fix for files under 16 bytes failing
+                        if file_size > 16:
+                            i += 16
+                        else:
+                            i = 0
+
                         block = chunk[i:i + 16]
-                        encryptor.encrypt(block)
+                        if len(block) % 16:
+                            block += makebyte('\0' * (16 - len(block) % 16))
+                        mac_str = mac_encryptor.encrypt(encryptor.encrypt(block))
 
-                    # fix for files under 16 bytes failing
-                    if file_size > 16:
-                        i += 16
-                    else:
-                        i = 0
-
-                    block = chunk[i:i + 16]
-                    if len(block) % 16:
-                        block += makebyte('\0' * (16 - len(block) % 16))
-                    mac_str = mac_encryptor.encrypt(encryptor.encrypt(block))
-
-                    # encrypt file and upload
-                    chunk = aes.encrypt(chunk)
-                    output_file = requests.post(ul_url + "/" +
-                                                str(chunk_start),
-                                                data=chunk,
+                        # encrypt file and upload
+                        chunk = aes.encrypt(chunk)
+                        output_file = requests.post(ul_url + "/" +
+                                                    str(chunk_start),
+                                                    data=chunk,
+                                                    timeout=self.timeout)
+                        completion_file_handle = output_file.text
+                        logger.info('%s of %s uploaded', upload_progress,
+                                    file_size)
+                        pbar.update(len(chunk)) # Update tqdm here
+                else: # Handle empty files
+                    output_file = requests.post(ul_url + "/0",
+                                                data='',
                                                 timeout=self.timeout)
                     completion_file_handle = output_file.text
-                    logger.info('%s of %s uploaded', upload_progress,
-                                file_size)
-            else:
-                output_file = requests.post(ul_url + "/0",
-                                            data='',
-                                            timeout=self.timeout)
-                completion_file_handle = output_file.text
+                    pbar.update(file_size) # Update tqdm for 0-byte file
 
-            logger.info('Chunks uploaded')
-            logger.info('Setting attributes to complete upload')
-            logger.info('Computing attributes')
-            file_mac = str_to_a32(mac_str)
+                logger.info('Chunks uploaded')
+                logger.info('Setting attributes to complete upload')
+                logger.info('Computing attributes')
+                file_mac = str_to_a32(mac_str)
 
-            # determine meta mac
-            meta_mac = (file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3])
+                # determine meta mac
+                meta_mac = (file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3])
 
-            dest_filename = dest_filename or os.path.basename(filename)
-            attribs = {'n': dest_filename}
+                dest_filename = dest_filename or os.path.basename(filename)
+                attribs = {'n': dest_filename}
 
-            encrypt_attribs = base64_url_encode(
-                encrypt_attr(attribs, ul_key[:4]))
-            key = [
-                ul_key[0] ^ ul_key[4], ul_key[1] ^ ul_key[5],
-                ul_key[2] ^ meta_mac[0], ul_key[3] ^ meta_mac[1], ul_key[4],
-                ul_key[5], meta_mac[0], meta_mac[1]
-            ]
-            encrypted_key = a32_to_base64(encrypt_key(key, self.master_key))
-            logger.info('Sending request to update attributes')
-            # update attributes
-            data = self._api_request({
-                'a':
-                'p',
-                't':
-                dest,
-                'i':
-                self.request_id,
-                'n': [{
-                    'h': completion_file_handle,
-                    't': 0,
-                    'a': encrypt_attribs,
-                    'k': encrypted_key
-                }]
-            })
-            logger.info('Upload complete')
-            return data
+                encrypt_attribs = base64_url_encode(
+                    encrypt_attr(attribs, ul_key[:4]))
+                key = [
+                    ul_key[0] ^ ul_key[4], ul_key[1] ^ ul_key[5],
+                    ul_key[2] ^ meta_mac[0], ul_key[3] ^ meta_mac[1], ul_key[4],
+                    ul_key[5], meta_mac[0], meta_mac[1]
+                ]
+                encrypted_key = a32_to_base64(encrypt_key(key, self.master_key))
+                logger.info('Sending request to update attributes')
+                # update attributes
+                data = self._api_request({
+                    'a':
+                    'p',
+                    't':
+                    dest,
+                    'i':
+                    self.request_id,
+                    'n': [{
+                        'h': completion_file_handle,
+                        't': 0,
+                        'a': encrypt_attribs,
+                        'k': encrypted_key
+                    }]
+                })
+                logger.info('Upload complete')
+                return data
 
     def _mkdir(self, name, parent_node_id):
         # generate random aes key (128) for folder
@@ -1062,7 +1077,7 @@ class Mega:
         # Providing dest_name spares an API call to retrieve it.
         if dest_name is None:
             pl_info = self.get_public_file_info(file_handle, file_key)
-            dest_name = pl_info['name']
+            dest_name = pl_info['name'] # Changed from 'pl_info['name']' because previous versions used 'n' for name
 
         key = base64_to_a32(file_key)
         k = (key[0] ^ key[4], key[1] ^ key[5], key[2] ^ key[6],

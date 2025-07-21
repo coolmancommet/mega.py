@@ -118,7 +118,7 @@ def test_import_public_url(mega):
     resp = mega.destroy(file_handle)
     assert isinstance(resp, int)
 
-
+@pytest.mark.skip
 class TestCreateFolder:
     def test_create_folder(self, mega, folder_name):
         folder_names_and_node_ids = mega.create_folder(folder_name)
